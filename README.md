@@ -1,4 +1,4 @@
-# Golang Binary Siza Analyzer
+# Golang Binary Size Analyzer
 
 Next steps:
 
