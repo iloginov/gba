@@ -1,5 +1,7 @@
 # Golang Binary Size Analyzer
 
+![Result example](/docs/graph.png?raw=true)
+
 Next steps:
 
 1. Build analyzed package
