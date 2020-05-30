@@ -4,7 +4,7 @@
 
 It's quite slow for now. I know.
 
-Examle usage:
+Example usage:
 
 ```
 gba --tree --level 2 github.com/cli/cli/cmd/gh
