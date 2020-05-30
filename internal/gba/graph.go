@@ -9,7 +9,7 @@ import (
 	"path"
 	"strings"
 
-	log "github.com/sirupsen/logrus"
+	"golang.org/x/tools/go/packages"
 )
 
 type Node struct {
@@ -19,7 +19,11 @@ type Node struct {
 	Deps     []*Node
 	DepsSize int64
 
-	HasParent bool
+	HasParent  bool
+	IsStd      bool
+	IsDirect   bool
+	Module     string
+	MainModule bool
 }
 
 type ModuleGraph struct {
@@ -95,7 +99,7 @@ func scanSubDir(dir string, sub string, modules map[string]dirDesc) (map[string]
 	for _, f := range files {
 		matched, err := path.Match("*.a", f.Name())
 		if err != nil {
-			log.Error(err)
+			fmt.Println(err.Error())
 			continue
 		}
 		if matched {
@@ -110,10 +114,10 @@ func scanSubDir(dir string, sub string, modules map[string]dirDesc) (map[string]
 			modules[sub] = mod
 		}
 
-		if f.Name() == "importcfg" || f.Name() == "importcfg.link" {
+		if f.Name() == "importcfg" {
 			file, err := os.Open(path.Join(dir, sub, f.Name()))
 			if err != nil {
-				log.Error(err)
+				fmt.Println(err.Error())
 				continue
 			}
 
@@ -160,12 +164,47 @@ func scanSubDir(dir string, sub string, modules map[string]dirDesc) (map[string]
 
 			modules[sub] = mod
 		}
+
+		if f.Name() == "importcfg.link" {
+			file, err := os.Open(path.Join(dir, sub, f.Name()))
+			if err != nil {
+				fmt.Println(err.Error())
+				continue
+			}
+
+			scanner := bufio.NewScanner(file)
+			scanner.Split(bufio.ScanLines)
+
+			var mod dirDesc
+			var ok bool
+			if mod, ok = modules[sub]; !ok {
+				mod = dirDesc{
+					Deps: []string{},
+				}
+			}
+
+			for scanner.Scan() {
+				line := scanner.Text()
+				if strings.HasPrefix(line, "packagefile ") {
+					parts := strings.Split(strings.Split(line, " ")[1], "=")
+					name := parts[0]
+					buildDir := strings.TrimPrefix(strings.TrimPrefix(strings.TrimSuffix(parts[1], "/_pkg_.a"), dir), "/")
+
+					if buildDir == sub {
+						mod.Name = name
+					}
+				}
+			}
+			file.Close()
+
+			modules[sub] = mod
+		}
 	}
 
 	return modules, nil
 }
 
-func BuildModuleGraph(dir string) (*ModuleGraph, error) {
+func BuildModuleGraph(pkg string, dir string) (*ModuleGraph, error) {
 	mods := make(map[string]dirDesc)
 
 	files, err := ioutil.ReadDir(dir)
@@ -183,11 +222,14 @@ func BuildModuleGraph(dir string) (*ModuleGraph, error) {
 	}
 
 	// Make graph
+	mapping := make(map[string]string)
+
 	graph := &ModuleGraph{
 		Nodes: make(map[string]*Node),
 	}
 	for k, v := range mods {
-		graph.Nodes[k] = &Node{
+		mapping[k] = v.Name
+		graph.Nodes[v.Name] = &Node{
 			ID:       k,
 			Name:     v.Name,
 			Size:     v.Size,
@@ -196,9 +238,9 @@ func BuildModuleGraph(dir string) (*ModuleGraph, error) {
 		}
 	}
 	for k, v := range mods {
-		n := graph.Nodes[k]
+		n := graph.Nodes[mapping[k]]
 		for _, v1 := range v.Deps {
-			d := graph.Nodes[v1]
+			d := graph.Nodes[mapping[v1]]
 			d.HasParent = true
 			n.Deps = append(n.Deps, d)
 		}
@@ -213,15 +255,59 @@ func BuildModuleGraph(dir string) (*ModuleGraph, error) {
 		}
 	}
 
-	// Calc dependencies cost
-	calcDepsCost(graph.Root)
-	log.Infof("Root deps cost: %s", ByteCountBinary(graph.Root.DepsSize))
-
-	var totalCost int64
-	for _, v := range graph.Nodes {
-		totalCost = totalCost + v.Size
+	// Mark standart packages
+	pkgs, err := packages.Load(nil, "std")
+	if err != nil {
+		return nil, err
 	}
-	log.Infof("Total cost: %s", ByteCountBinary(totalCost))
+	stdPkgs := make(map[string]struct{})
+	for _, p := range pkgs {
+		stdPkgs[p.PkgPath] = struct{}{}
+	}
+
+	for _, v := range graph.Nodes {
+		if _, ok := stdPkgs[v.Name]; ok {
+			v.IsStd = true
+		}
+	}
+
+	// Mark modules
+	cfg := &packages.Config{Mode: packages.LoadImports | packages.NeedDeps | packages.NeedModule}
+	pkgs, err = packages.Load(cfg, pkg)
+	if err != nil {
+		return nil, err
+	}
+
+	var mainModule string
+	printPkg := func(p *packages.Package) {
+		if n, ok := graph.Nodes[p.PkgPath]; ok {
+			if p.Module != nil {
+				n.Module = p.Module.Path
+				if p.PkgPath == pkg {
+					mainModule = p.Module.Path
+				}
+			}
+		}
+	}
+
+	packages.Visit(pkgs, nil, printPkg)
+
+	for _, v := range graph.Nodes {
+		if v.Module == mainModule {
+			v.MainModule = true
+		}
+	}
+
+	// Mark direct dependencies
+	for _, v := range graph.Nodes {
+		if v.MainModule {
+			for _, v1 := range v.Deps {
+				v1.IsDirect = true
+			}
+		}
+	}
+
+	calcDepsCost(graph.Root)
 
 	return graph, nil
 }
@@ -233,11 +319,18 @@ func (g *ModuleGraph) MakeDotFile() ([]byte, error) {
 	builder.start()
 
 	for _, v := range g.Nodes {
+		if !v.MainModule && !v.IsDirect {
+			continue
+		}
+
 		builder.addNode(v.ID, v)
 	}
 
 	for _, v := range g.Nodes {
 		for _, v1 := range v.Deps {
+			if (!v.MainModule && !v.IsDirect) || (!v1.MainModule && !v1.IsDirect) {
+				continue
+			}
 			builder.addEdge(v.ID, v1.ID)
 		}
 	}
@@ -248,20 +341,27 @@ func (g *ModuleGraph) MakeDotFile() ([]byte, error) {
 }
 
 func (n *Node) stringHelper(prefix string, level int, maxLevel int, buf *bytes.Buffer) {
-	if level > maxLevel {
+	if maxLevel != -1 && level > maxLevel {
 		return
 	}
+
+	if !n.MainModule && !n.IsDirect || n.IsStd {
+		return
+	}
+
 	buf.WriteString(prefix)
 	if level > 0 {
 		buf.WriteString("├")
 		buf.WriteString(strings.Repeat("─", (level*4)-2))
 		buf.WriteString(" ")
 	}
-	buf.WriteString(n.Name + " " + ByteCountBinary(n.Size) + "\n")
+	buf.WriteString(n.Name + " up to " + ByteCountBinary(n.Size+n.DepsSize) + "\n")
 	level++
 
-	for _, ch := range n.Deps {
-		ch.stringHelper(prefix, level, maxLevel, buf)
+	if n.MainModule {
+		for _, ch := range n.Deps {
+			ch.stringHelper(prefix, level, maxLevel, buf)
+		}
 	}
 }
 

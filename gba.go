@@ -1,36 +1,57 @@
 package main
 
 import (
-	log "github.com/sirupsen/logrus"
+	"flag"
+	"fmt"
+	"io/ioutil"
+	"log"
 
 	"github.com/iloginov/gba/internal/gba"
 )
 
+var tree = flag.Bool("tree", false, "print dependency tree")
+var level = flag.Int("level", 3, "max tree level to print (-1 to out whole tree)")
+var dot = flag.Bool("dot", false, "create dependency graph in Graphviz dot format")
+var file = flag.String("file", "graph.dot", "name of the output .dot file (default 'graph.dot'")
+
 func main() {
 	var err error
 
-	pkg := "gandalf/cmd/gandalf"
-	//workDir := "/tmp/go-build656671572/"
+	flag.Parse()
+
+	if !*tree && !*dot {
+		fmt.Println("You should choose one of the output options")
+		return
+	}
+
+	if len(flag.Args()) != 1 {
+		fmt.Println("You should give package name")
+		return
+	}
+	pkg := flag.Arg(0)
 
 	workDir, err := gba.BuildPackage(pkg)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal(err.Error())
 	}
-	log.Infof("Build directory: %s", workDir)
 
-	graph, err := gba.BuildModuleGraph(workDir)
+	graph, err := gba.BuildModuleGraph(pkg, workDir)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal(err.Error())
 	}
 
-	// dot, err := graph.MakeDotFile()
-	// if err != nil {
-	// 	log.Error(err)
-	// 	return
-	// }
+	if *dot {
+		dot, err := graph.MakeDotFile()
+		if err != nil {
+			log.Fatal(err.Error())
+			return
+		}
 
-	// ioutil.WriteFile("graph.dot", dot, 0644)
+		ioutil.WriteFile(*file, dot, 0644)
+	}
 
-	tree := graph.PrintTree(3)
-	log.Info(tree)
+	if *tree {
+		tree := graph.PrintTree(*level)
+		fmt.Println(tree)
+	}
 }
